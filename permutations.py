@@ -33,30 +33,43 @@ def count_distinct_sums(r, n, ndigits=9, return_sums=False, max_bits=None,
 
     # progress is anything tqdm-shaped: called with a total, then updated and
     # closed. It is owned here rather than by the loops below so that it can be
-    # filled to n on the way out, terms that were skipped included.
-    bar = _Progress(progress, n)
+    # filled on the way out, work that was skipped included.
+    bar = _Progress(progress)
     answer = _counted(r, n, ndigits, return_sums, max_bits, bar)
     bar.finish()
     return answer
 
 
 class _Progress:
-    def __init__(self, factory, total):
-        self.bar = None if factory is None else factory(total=total)
-        self.total = total
+    # Counted in units of work rather than terms, because the terms are not
+    # equal: each one sweeps everything reachable so far, which keeps growing.
+    # Whichever engine runs says up front how many units it expects.
+    def __init__(self, factory):
+        self.factory = factory
+        self.bar = None
+        self.total = 0
         self.done = 0
 
-    def step(self):
-        self.done += 1
+    def expect(self, total):
+        self.total = total
+        if self.factory is not None:
+            self.bar = self.factory(total=total)
+
+    def step(self, work=1):
+        self.done += work
         if self.bar is not None:
-            self.bar.update(1)
+            self.bar.update(work)
 
     def finish(self):
-        # Skipping the rest of the terms still settles them, so the bar ends
-        # full rather than wherever the shortcut happened to stop.
+        # Skipping the remaining work still settles it, so the bar ends full
+        # rather than wherever the shortcut happened to stop.
         if self.bar is not None:
             self.bar.update(self.total - self.done)
             self.bar.close()
+        elif self.factory is not None:  # answered before any engine started
+            done = self.factory(total=1)
+            done.update(1)
+            done.close()
 
 
 def _counted(r, n, ndigits, return_sums, max_bits, bar):
@@ -217,12 +230,15 @@ def _quantise(ratios, ndigits):
             for num, den in ratios}
     return scale, sorted(grid)
 
+
 def _sparse_totals(ws, n, expected, biggest, bar):
     # Deduplicating int64 arrays by sorting only beats a Python set when the
     # sort is a GPU's, so this asks for one and otherwise stays with the set,
     # which has no size ceiling either. Totals too large for an int64 likewise
     # stay in Python ints, which cannot overflow.
     xp = _array_module() if expected > _ARRAY_FROM and biggest < _INT64_CEILING else None
+    bar.expect(n)  # a term's cost follows how many totals there are, so it
+    #                cannot be weighted ahead of time the way the mask can
     if xp is None:
         totals = {0}
         for _ in range(n):
@@ -319,10 +335,11 @@ def _dp_count(runs, top, n, need_totals, bar):
     shape = None
     shape_round = 0
     holes = -1
+    bar.expect(n * (n + 1) // 2)  # term k sweeps k times the first term's bits
 
     for k in range(1, n + 1):
         mask = _one_more_term(mask, runs)
-        bar.step()
+        bar.step(k)
         if need_totals or k == n:
             continue
 
