@@ -12,6 +12,9 @@ _WINDOW_FROM = 1 << 22
 # Totals are only put in int64 arrays while they cannot overflow one.
 _INT64_CEILING = 1 << 62
 
+# More totals than this and no machine is going to hold them either.
+_SPARSE_CEILING = 1 << 40
+
 # Fewer totals than this and a Python set beats the array machinery.
 _ARRAY_FROM = 1 << 14
 
@@ -53,11 +56,15 @@ def count_distinct_sums(r, n, ndigits=9, return_sums=False, max_bits=1 << 30):
     # so compare the two sizes before committing to either.
     dense_bits = n * top + 1
     expected = _multiset_bound(n, len(ws), dense_bits // _SET_OVERHEAD + 1)
-    if expected * _SET_OVERHEAD < dense_bits:
+
+    def by_totals():
         totals = _sparse_totals(ws, n, expected, n * top)
         if return_sums:
             return len(totals), [decode(int(y)) for y in totals]
         return len(totals)
+
+    if expected * _SET_OVERHEAD < dense_bits:
+        return by_totals()
 
     # For a large n only the two ends of the reachable set have to be looked at.
     if not return_sums and dense_bits > _WINDOW_FROM:
@@ -65,7 +72,17 @@ def count_distinct_sums(r, n, ndigits=9, return_sums=False, max_bits=1 << 30):
         if count is not None:
             return count
 
-    count, mask = _dp_count(_runs(ws), top, n, return_sums, max_bits)
+    if dense_bits > max_bits:
+        # No mask that size will fit, so the totals are the only way left. The
+        # count of them is an upper bound and often a loose one, so this is
+        # worth trying unless even that bound is hopeless.
+        if expected > _SPARSE_CEILING:
+            raise MemoryError(
+                f"needs {dense_bits} bits, or upwards of {expected} totals: the"
+                " values sit on too fine a grid. Round them with ndigits.")
+        return by_totals()
+
+    count, mask = _dp_count(_runs(ws), top, n, return_sums)
     if return_sums:
         return count, [decode(index) for index in _set_bits(mask)]
     return count
@@ -167,17 +184,14 @@ def _one_more_term(mask, runs):
     return nxt
 
 
-def _dp_count(runs, top, n, need_totals, max_bits):
+def _dp_count(runs, top, n, need_totals):
+    # Only ever called once the caller knows the full mask will fit.
     mask = 1
     shape = None
     shape_round = 0
     holes = -1
 
     for k in range(1, n + 1):
-        if k * top + 1 > max_bits:
-            raise MemoryError(
-                f"needs {k * top + 1} bits at term {k}: the values sit on too fine"
-                " a grid. Round them with ndigits, or raise max_bits.")
         mask = _one_more_term(mask, runs)
         if need_totals or k == n:
             continue
