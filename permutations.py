@@ -30,10 +30,38 @@ def count_distinct_sums(r, n, ndigits=9, return_sums=False, max_bits=None,
                         progress=None):
     if n < 0:
         raise ValueError("n must be non-negative")
+
+    # progress is anything tqdm-shaped: called with a total, then updated and
+    # closed. It is owned here rather than by the loops below so that it can be
+    # filled to n on the way out, terms that were skipped included.
+    bar = _Progress(progress, n)
+    answer = _counted(r, n, ndigits, return_sums, max_bits, bar)
+    bar.finish()
+    return answer
+
+
+class _Progress:
+    def __init__(self, factory, total):
+        self.bar = None if factory is None else factory(total=total)
+        self.total = total
+        self.done = 0
+
+    def step(self):
+        self.done += 1
+        if self.bar is not None:
+            self.bar.update(1)
+
+    def finish(self):
+        # Skipping the rest of the terms still settles them, so the bar ends
+        # full rather than wherever the shortcut happened to stop.
+        if self.bar is not None:
+            self.bar.update(self.total - self.done)
+            self.bar.close()
+
+
+def _counted(r, n, ndigits, return_sums, max_bits, bar):
     if max_bits is None:
         max_bits = free_memory() * 8 // _SAFETY
-    if progress is None:  # anything that wraps an iterable, tqdm for instance
-        progress = _no_progress
 
     scale, values = _on_grid(r, ndigits)
     if n == 0:
@@ -67,7 +95,7 @@ def count_distinct_sums(r, n, ndigits=9, return_sums=False, max_bits=None,
     expected = _multiset_bound(n, len(ws), dense_bits // _SET_OVERHEAD + 1)
 
     def by_totals():
-        totals = _sparse_totals(ws, n, expected, n * top, progress)
+        totals = _sparse_totals(ws, n, expected, n * top, bar)
         if return_sums:
             return len(totals), [decode(int(y)) for y in totals]
         return len(totals)
@@ -91,10 +119,11 @@ def count_distinct_sums(r, n, ndigits=9, return_sums=False, max_bits=None,
                 " values sit on too fine a grid. Round them with ndigits.")
         return by_totals()
 
-    count, mask = _dp_count(_runs(ws), top, n, return_sums, progress)
+    count, mask = _dp_count(_runs(ws), top, n, return_sums, bar)
     if return_sums:
         return count, [decode(index) for index in _set_bits(mask)]
     return count
+
 
 def max_ndigits(values, n, budget=None, ceiling=30):
     # The finest decimal grid whose totals this machine can still hold, which
@@ -188,7 +217,7 @@ def _quantise(ratios, ndigits):
             for num, den in ratios}
     return scale, sorted(grid)
 
-def _sparse_totals(ws, n, expected, biggest, progress):
+def _sparse_totals(ws, n, expected, biggest, bar):
     # Deduplicating int64 arrays by sorting only beats a Python set when the
     # sort is a GPU's, so this asks for one and otherwise stays with the set,
     # which has no size ceiling either. Totals too large for an int64 likewise
@@ -196,15 +225,16 @@ def _sparse_totals(ws, n, expected, biggest, progress):
     xp = _array_module() if expected > _ARRAY_FROM and biggest < _INT64_CEILING else None
     if xp is None:
         totals = {0}
-        for _ in progress(range(n)):
+        for _ in range(n):
             totals = {total + w for total in totals for w in ws}
+            bar.step()
             _room_for(len(totals) * _SET_OVERHEAD // 8, _free_ram(), len(totals))
         return sorted(totals)
 
     values = xp.asarray(ws, dtype=xp.int64)
     totals = xp.zeros(1, dtype=xp.int64)
     try:
-        for _ in progress(range(n)):
+        for _ in range(n):
             # How many totals there are is what the answer is, so it cannot be
             # known ahead of time. Check there is still room for them instead.
             _room_for(totals.size * 8 * _SAFETY, _free_gpu(xp), totals.size)
@@ -216,6 +246,7 @@ def _sparse_totals(ws, n, expected, biggest, progress):
                 part = xp.unique(totals[:, None] + values[i:i + step])
                 grown = part if grown is None else xp.unique(xp.concatenate((grown, part)))
             totals = grown
+            bar.step()
     except Exception as failure:  # cupy's own out-of-memory, as a backstop
         if type(failure).__name__ != "OutOfMemoryError":
             raise
@@ -251,10 +282,6 @@ def _array_module():
 # --- the totals held as bits ------------------------------------------------
 
 
-def _no_progress(iterable):
-    return iterable
-
-
 def _runs(ws):
     # Group the values into maximal runs of consecutive grid points, so a run
     # costs one shift plus log2(length) smears instead of one shift per value.
@@ -286,15 +313,16 @@ def _one_more_term(mask, runs):
     return nxt
 
 
-def _dp_count(runs, top, n, need_totals, progress):
+def _dp_count(runs, top, n, need_totals, bar):
     # Only ever called once the caller knows the full mask will fit.
     mask = 1
     shape = None
     shape_round = 0
     holes = -1
 
-    for k in progress(range(1, n + 1)):
+    for k in range(1, n + 1):
         mask = _one_more_term(mask, runs)
+        bar.step()
         if need_totals or k == n:
             continue
 
