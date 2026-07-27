@@ -21,10 +21,16 @@ _ARRAY_FROM = 1 << 14
 # Elements per intermediate array, which bounds the working set on the GPU.
 _ARRAY_CHUNK = 1 << 24
 
+# Peak working memory runs to a few times whatever is being held, so only this
+# fraction of what is free can be counted on.
+_SAFETY = 4
 
-def count_distinct_sums(r, n, ndigits=9, return_sums=False, max_bits=1 << 30):
+
+def count_distinct_sums(r, n, ndigits=9, return_sums=False, max_bits=None):
     if n < 0:
         raise ValueError("n must be non-negative")
+    if max_bits is None:
+        max_bits = free_memory() * 8 // _SAFETY
 
     scale, values = _on_grid(r, ndigits)
     if n == 0:
@@ -87,13 +93,86 @@ def count_distinct_sums(r, n, ndigits=9, return_sums=False, max_bits=1 << 30):
         return count, [decode(index) for index in _set_bits(mask)]
     return count
 
+def max_ndigits(values, n, budget=None, ceiling=30):
+    # The finest decimal grid whose totals this machine can still hold, which
+    # is what caps ndigits: a finer grid means a larger integer per value, and
+    # so more grid points between the smallest and largest total. Lists of
+    # integers are unaffected by the grid and come back with the ceiling.
+    if budget is None:
+        budget = free_memory() // _SAFETY
+    bits = budget * 8
+
+    ratios = [value.as_integer_ratio() for value in values]
+    low, high = 0, ceiling
+    while low < high:
+        middle = (low + high + 1) // 2
+        if n * _grid_top(ratios, middle) + 1 <= bits:
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
+def gpu_ready():
+    # Whether the totals will be counted on a GPU rather than in a Python set.
+    return _array_module() is not None
+
+
+def free_memory():
+    # Bytes free for the totals, which is the GPU's when they would live there.
+    free = _free_ram()
+    xp = _array_module()
+    if xp is not None:
+        free = min(free, _free_gpu(xp))
+    return free
+
+
+def _free_ram():
+    try:
+        with open("/proc/meminfo") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:
+        import os
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        return 1 << 31  # no way to tell, so assume a modest 2 GiB
+
+
+def _free_gpu(xp):
+    # What the device has left, plus whatever cupy holds in its pool without
+    # using, since that comes back for free.
+    try:
+        return int(xp.cuda.Device().mem_info[0]
+                   + xp.get_default_memory_pool().free_bytes())
+    except Exception:
+        return 1 << 62  # cannot tell, so leave it to the allocator
+
+
+def _grid_top(ratios, ndigits):
+    # Largest grid index the values reach once slid to start at 0 and divided
+    # by their common spacing: the width the totals are counted over.
+    _, grid = _quantise(ratios, ndigits)
+    if len(grid) < 2:
+        return 0
+    spacing = 0
+    for value in grid:
+        spacing = gcd(spacing, value - grid[0])
+    return (grid[-1] - grid[0]) // spacing
+
+
 def _on_grid(values, ndigits):
-    # Returns the scale the grid counts in and the values as exact multiples of
-    # it. as_integer_ratio is exact for ints, floats and Fractions alike, so a
+    # as_integer_ratio is exact for ints, floats and Fractions alike, so a
     # value sitting right on a rounding boundary cannot fall the wrong side of
     # it and throw the common spacing off.
-    ratios = [value.as_integer_ratio() for value in values]
+    return _quantise([value.as_integer_ratio() for value in values], ndigits)
 
+
+def _quantise(ratios, ndigits):
+    # Returns the scale the grid counts in and the values as exact multiples.
     if ndigits is None:
         # Exact: a common denominator rounds nothing away at all.
         scale = 1
@@ -116,20 +195,36 @@ def _sparse_totals(ws, n, expected, biggest):
         totals = {0}
         for _ in range(n):
             totals = {total + w for total in totals for w in ws}
+            _room_for(len(totals) * _SET_OVERHEAD // 8, _free_ram(), len(totals))
         return sorted(totals)
 
     values = xp.asarray(ws, dtype=xp.int64)
     totals = xp.zeros(1, dtype=xp.int64)
-    for _ in range(n):
-        # Fold the values in a chunk at a time, keeping the intermediate a
-        # bounded size and never holding more than two large arrays at once.
-        step = max(1, _ARRAY_CHUNK // totals.size)
-        grown = None
-        for i in range(0, values.size, step):
-            part = xp.unique(totals[:, None] + values[i:i + step])
-            grown = part if grown is None else xp.unique(xp.concatenate((grown, part)))
-        totals = grown
+    try:
+        for _ in range(n):
+            # How many totals there are is what the answer is, so it cannot be
+            # known ahead of time. Check there is still room for them instead.
+            _room_for(totals.size * 8 * _SAFETY, _free_gpu(xp), totals.size)
+            # Fold the values in a chunk at a time, keeping the intermediate a
+            # bounded size and never holding more than two large arrays at once.
+            step = max(1, _ARRAY_CHUNK // totals.size)
+            grown = None
+            for i in range(0, values.size, step):
+                part = xp.unique(totals[:, None] + values[i:i + step])
+                grown = part if grown is None else xp.unique(xp.concatenate((grown, part)))
+            totals = grown
+    except Exception as failure:  # cupy's own out-of-memory, as a backstop
+        if type(failure).__name__ != "OutOfMemoryError":
+            raise
+        _room_for(totals.size * 8 * _SAFETY, 0, totals.size)
     return totals
+
+
+def _room_for(needed, free, reached):
+    if needed > free:
+        raise MemoryError(
+            f"{reached} totals reached and the next term needs {needed} bytes"
+            f" against {free} free: lower ndigits, or n, or r.")
 
 
 _ARRAY_MODULE = ...  # not looked up yet
