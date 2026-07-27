@@ -26,11 +26,14 @@ _ARRAY_CHUNK = 1 << 24
 _SAFETY = 4
 
 
-def count_distinct_sums(r, n, ndigits=9, return_sums=False, max_bits=None):
+def count_distinct_sums(r, n, ndigits=9, return_sums=False, max_bits=None,
+                        progress=None):
     if n < 0:
         raise ValueError("n must be non-negative")
     if max_bits is None:
         max_bits = free_memory() * 8 // _SAFETY
+    if progress is None:  # anything that wraps an iterable, tqdm for instance
+        progress = _no_progress
 
     scale, values = _on_grid(r, ndigits)
     if n == 0:
@@ -64,7 +67,7 @@ def count_distinct_sums(r, n, ndigits=9, return_sums=False, max_bits=None):
     expected = _multiset_bound(n, len(ws), dense_bits // _SET_OVERHEAD + 1)
 
     def by_totals():
-        totals = _sparse_totals(ws, n, expected, n * top)
+        totals = _sparse_totals(ws, n, expected, n * top, progress)
         if return_sums:
             return len(totals), [decode(int(y)) for y in totals]
         return len(totals)
@@ -88,7 +91,7 @@ def count_distinct_sums(r, n, ndigits=9, return_sums=False, max_bits=None):
                 " values sit on too fine a grid. Round them with ndigits.")
         return by_totals()
 
-    count, mask = _dp_count(_runs(ws), top, n, return_sums)
+    count, mask = _dp_count(_runs(ws), top, n, return_sums, progress)
     if return_sums:
         return count, [decode(index) for index in _set_bits(mask)]
     return count
@@ -185,7 +188,7 @@ def _quantise(ratios, ndigits):
             for num, den in ratios}
     return scale, sorted(grid)
 
-def _sparse_totals(ws, n, expected, biggest):
+def _sparse_totals(ws, n, expected, biggest, progress):
     # Deduplicating int64 arrays by sorting only beats a Python set when the
     # sort is a GPU's, so this asks for one and otherwise stays with the set,
     # which has no size ceiling either. Totals too large for an int64 likewise
@@ -193,7 +196,7 @@ def _sparse_totals(ws, n, expected, biggest):
     xp = _array_module() if expected > _ARRAY_FROM and biggest < _INT64_CEILING else None
     if xp is None:
         totals = {0}
-        for _ in range(n):
+        for _ in progress(range(n)):
             totals = {total + w for total in totals for w in ws}
             _room_for(len(totals) * _SET_OVERHEAD // 8, _free_ram(), len(totals))
         return sorted(totals)
@@ -201,7 +204,7 @@ def _sparse_totals(ws, n, expected, biggest):
     values = xp.asarray(ws, dtype=xp.int64)
     totals = xp.zeros(1, dtype=xp.int64)
     try:
-        for _ in range(n):
+        for _ in progress(range(n)):
             # How many totals there are is what the answer is, so it cannot be
             # known ahead of time. Check there is still room for them instead.
             _room_for(totals.size * 8 * _SAFETY, _free_gpu(xp), totals.size)
@@ -248,6 +251,10 @@ def _array_module():
 # --- the totals held as bits ------------------------------------------------
 
 
+def _no_progress(iterable):
+    return iterable
+
+
 def _runs(ws):
     # Group the values into maximal runs of consecutive grid points, so a run
     # costs one shift plus log2(length) smears instead of one shift per value.
@@ -279,14 +286,14 @@ def _one_more_term(mask, runs):
     return nxt
 
 
-def _dp_count(runs, top, n, need_totals):
+def _dp_count(runs, top, n, need_totals, progress):
     # Only ever called once the caller knows the full mask will fit.
     mask = 1
     shape = None
     shape_round = 0
     holes = -1
 
-    for k in range(1, n + 1):
+    for k in progress(range(1, n + 1)):
         mask = _one_more_term(mask, runs)
         if need_totals or k == n:
             continue
